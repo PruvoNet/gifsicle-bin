@@ -1,4 +1,5 @@
 node_modules
 vendor/gifsicle*
-vendor/share/man
+vendor/temp
 yarn.lock
+.DS_Store

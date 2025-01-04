@@ -25,4 +25,10 @@ then logout and run:
 scp -i sp-tmp.pem ec2-user@18.233.161.219:/home/ec2-user/gifsicle-1.93/src/gifsicle /Users/username/gifsicle/vendor/linux/64/gifsicle
 ```
 
+# Alpine Linux 
+
+```bash
+apk add autoconf intltool gcc musl-dev make automake
+```
+
 These instructions assume your ec2 instance is running at `18.233.161.219`.
