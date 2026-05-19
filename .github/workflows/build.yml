@@ -1,0 +1,247 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_ARCHIVE: vendor/source/gifsicle-1.93.tar.gz
+
+jobs:
+  build:
+    name: ${{ matrix.id }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # darwin-x64 is cross-compiled from macos-14 (arm64). The
+          # produced x86_64 binary runs on the build host via Rosetta 2
+          # (preinstalled on macos-14 runners), so we can run the test
+          # suite against it.
+          - id: darwin-x64
+            runner: macos-14
+            cross_arch: x86_64
+          - id: darwin-arm64
+            runner: macos-14
+          - id: linux-x64
+            runner: ubuntu-latest
+          - id: linux-x64-musl
+            runner: ubuntu-latest
+            musl: true
+          - id: linux-arm64
+            runner: ubuntu-24.04-arm
+          - id: linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            musl: true
+          - id: win32-x64
+            runner: windows-latest
+            windows: true
+          - id: win32-arm64
+            runner: windows-11-arm
+            windows: true
+            msys2_msystem: CLANGARM64
+            msys2_install: mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-autotools make
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          v=$(node -p "require('./package.json').version")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v"    >> "$GITHUB_OUTPUT"
+
+      # ── macOS ─ native arm64 OR x64 cross-built from arm64 ──
+      - name: Build (macOS)
+        if: startsWith(matrix.runner, 'macos')
+        env:
+          CROSS_ARCH: ${{ matrix.cross_arch }}
+        run: |
+          set -euo pipefail
+          brew install --quiet automake
+          tmp=$(mktemp -d)
+          tar -xzf "$SOURCE_ARCHIVE" -C "$tmp"
+          cd "$tmp"/gifsicle-*
+          host_arg=""
+          if [ -n "${CROSS_ARCH:-}" ]; then
+            export CFLAGS="-arch $CROSS_ARCH"
+            export LDFLAGS="-arch $CROSS_ARCH"
+            host_arg="--host=$CROSS_ARCH-apple-darwin"
+          fi
+          autoreconf -ivf
+          ./configure $host_arg --disable-gifview --disable-gifdiff
+          make -j"$(sysctl -n hw.ncpu)"
+          strip src/gifsicle
+          mkdir -p "$GITHUB_WORKSPACE/vendor"
+          cp src/gifsicle "$GITHUB_WORKSPACE/vendor/"
+
+      # ── Linux glibc (x64 or arm64 depending on runner) ──
+      - name: Build (Linux glibc)
+        if: startsWith(matrix.runner, 'ubuntu') && !matrix.musl
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y autoconf automake libtool make
+          tmp=$(mktemp -d)
+          tar -xzf "$SOURCE_ARCHIVE" -C "$tmp"
+          cd "$tmp"/gifsicle-*
+          autoreconf -ivf
+          ./configure --disable-gifview --disable-gifdiff
+          make -j"$(nproc)"
+          strip src/gifsicle
+          mkdir -p "$GITHUB_WORKSPACE/vendor"
+          cp src/gifsicle "$GITHUB_WORKSPACE/vendor/"
+
+      # ── Linux musl: build AND test inside the Alpine container so the
+      #    musl-linked binary is exercised against a musl loader. ──
+      - name: Build + test (Linux musl via Alpine docker)
+        if: matrix.musl
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            node:24-alpine sh -c '
+              set -e
+              apk add --no-cache autoconf automake libtool make gcc musl-dev tar
+              tmp=$(mktemp -d)
+              tar -xzf vendor/source/gifsicle-1.93.tar.gz -C "$tmp"
+              cd "$tmp"/gifsicle-*
+              autoreconf -ivf
+              ./configure --disable-gifview --disable-gifdiff
+              make -j"$(nproc)"
+              strip src/gifsicle
+              mkdir -p /work/vendor
+              cp src/gifsicle /work/vendor/
+              cd /work
+              # ava + tempy run on Node 24 inside the alpine container so the
+              # musl binary is loaded by the matching libc.
+              npm install --ignore-scripts
+              npx ava --timeout=60s
+            '
+
+      # ── Windows MSYS2 (x64 mingw OR arm64 clang) ──
+      - name: Set up MSYS2
+        if: matrix.windows
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msys2_msystem || 'MINGW64' }}
+          update: true
+          install: ${{ matrix.msys2_install || 'mingw-w64-x86_64-gcc mingw-w64-x86_64-autotools make' }}
+
+      - name: Build (Windows MSYS2)
+        if: matrix.windows
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          tar -xzf vendor/source/gifsicle-1.93.tar.gz -C "$tmp"
+          cd "$tmp"/gifsicle-*
+          autoreconf -ivf
+          ./configure --disable-gifview --disable-gifdiff LDFLAGS="-static -static-libgcc"
+          make -j"$(nproc)"
+          strip src/gifsicle.exe
+          mkdir -p "$GITHUB_WORKSPACE/vendor"
+          cp src/gifsicle.exe "$GITHUB_WORKSPACE/vendor/"
+
+      # ── For all non-musl variants, install deps and run ava against the
+      #    binary we just placed at vendor/. Skipped for musl because the
+      #    docker step above already ran ava inside Alpine. ──
+      - uses: actions/setup-node@v5
+        if: ${{ !matrix.musl }}
+        with:
+          node-version: '24.15.0'
+
+      - name: Install npm deps (skipping postinstall — binary already at vendor/)
+        if: ${{ !matrix.musl }}
+        shell: bash
+        run: npm install --ignore-scripts
+
+      - name: Test ${{ matrix.id }} binary
+        if: ${{ !matrix.musl }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la vendor/
+          npx ava --timeout=60s
+
+      # ── Tarball the freshly-built binary; the name matches what
+      #    lib/install.js will ask for on consumer machines. ──
+      - name: Tarball
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          name="gifsicle-${TAG}-${{ matrix.id }}.tar.gz"
+          tar -czf "artifacts/${name}" -C vendor $(ls vendor | grep -E '^gifsicle(\.exe)?$')
+          ls -la artifacts/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.id }}
+          path: artifacts/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  # Release only fires on push to master after every build job has gone
+  # green. main, cjs, feature branches and PR builds verify but never
+  # publish.
+  release:
+    name: auto-release on version bump
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read version from package.json
+        id: version
+        run: |
+          set -euo pipefail
+          v=$(node -p "require('./package.json').version")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v"    >> "$GITHUB_OUTPUT"
+
+      - name: Check whether tag already exists on origin
+        id: check_tag
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $tag already exists — nothing to release."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $tag does not exist — will release."
+          fi
+
+      - if: steps.check_tag.outputs.exists == 'false'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: bin-*
+          path: artifacts
+          merge-multiple: true
+
+      - if: steps.check_tag.outputs.exists == 'false'
+        run: ls -la artifacts/
+
+      - if: steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.version.outputs.tag }}
+          files: artifacts/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
