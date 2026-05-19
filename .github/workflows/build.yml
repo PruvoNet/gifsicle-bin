@@ -192,13 +192,13 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Release only fires on push to master after every build job has gone
-  # green. main, cjs, feature branches and PR builds verify but never
-  # publish.
+  # Release only fires on push to the repo's default branch (main here,
+  # master in node-expat) after every build job has gone green. Feature
+  # branches and PR builds verify but never publish.
   release:
     name: auto-release on version bump
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     permissions:
       contents: write
